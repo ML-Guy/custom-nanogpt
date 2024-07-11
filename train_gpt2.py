@@ -2,7 +2,7 @@ import os
 import math
 import time
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -201,55 +201,6 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-# -----------------------------------------------------------------------------
-import tiktoken
-import numpy as np
-
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
-
-class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        assert split in {'train', 'val'}
-
-        # get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
-            print(f"found {len(shards)} shards for split {split}")
-        self.reset()
-
-    def reset(self):
-        # state, init at shard zero
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
-
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
-        self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
-        return x, y
 
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
@@ -330,13 +281,35 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+model_config = GPTConfig(vocab_size=50304)
+
+# init WanB
+if master_process:
+    import wandb
+    wandb.init(project="gpt2-training", config={
+        "total_batch_size": total_batch_size,
+        "micro_batch_size": B,
+        "sequence_length": T,
+        "max_lr": max_lr,
+        "min_lr": min_lr,
+        "warmup_steps": warmup_steps,
+        "max_steps": max_steps,
+        "model": asdict(model_config),
+        "dataset": DataLoaderLite.name
+    })
+
+from dataset import DataLoaderTiny as DataLoaderLite
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", print_log=master_process)
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", print_log=master_process)
 
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(model_config)
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
@@ -346,10 +319,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -395,6 +365,7 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            wandb.log({"val_loss": val_loss_accum.item()}, step=step)
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
@@ -412,6 +383,7 @@ for step in range(max_steps):
 
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
+        val_t0 = time.time()
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -438,8 +410,11 @@ for step in range(max_steps):
             num_total = num_total.item()
             num_correct_norm = num_correct_norm.item()
         acc_norm = num_correct_norm / num_total
+        val_dt = time.time() - val_t0
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            print(f"HellaSwag time: {val_dt:.2f}s")
+            wandb.log({"hellaswag_accuracy": acc_norm}, step=step)
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
@@ -514,8 +489,17 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        wandb.log({
+            "train_loss": loss_accum.item(),
+            "learning_rate": lr,
+            "grad_norm": norm,
+            "step_time": dt,
+            "tokens_per_second": tokens_per_sec
+        }, step=step)
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
+if master_process:
+    wandb.finish()
