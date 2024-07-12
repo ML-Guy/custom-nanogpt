@@ -42,6 +42,8 @@ def plot_codebook_usage(codebook_usage, num_elements, ddp=False, dist=None):
     plt.tight_layout()
     return fig
 
+dictloss2str = lambda loss_dict: " | ".join([f"{key}: {value:.4f}" for key, value in loss_dict.items()])
+
 # -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
@@ -194,15 +196,17 @@ for step in range(max_steps):
 
         if master_process:
             val_loss_accum = {k:v.item() for k,v in val_loss_accum.items()}
-            print(f"validation loss: {val_loss_accum}")
-            print(f"Codebook Usage: {[(codebook_usage[b]>0).sum().item() for b in codebook_usage]}")
+            nonzero_codebook = [(codebook_usage[b]>0).sum().item() for b in codebook_usage]
+            print(f"validation loss: {dictloss2str(val_loss_accum)}")
+            print(f"Codebook Usage: {nonzero_codebook}")
 
             codebook_usage_plot = plot_codebook_usage(codebook_usage, model_config.cb_num_elements)
             wandb.log({"val_"+k:v for k,v in val_loss_accum.items()}, step=step)
-            wandb.log({'val_codebook_usage': wandb.Image(codebook_usage_plot)}, step=step)
+            wandb.log({'val_codebook_usage': wandb.Image(codebook_usage_plot), 
+                       "val_nonzero_codebook": sum(nonzero_codebook)/len(nonzero_codebook)}, step=step)
             
             with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                f.write(f"{step} val - {dictloss2str(val_loss_accum)}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -331,18 +335,19 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        print({k:v.item() for k,v in losses_accum.items()})
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f}| dist_temp: {model.cb_decoder.dist_temp.item():.3f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(dictloss2str(losses_accum))
         wandb.log({
             "train_loss": loss_accum.item(),
             "learning_rate": lr,
             "grad_norm": norm,
             "step_time": dt,
-            "tokens_per_second": tokens_per_sec
+            "tokens_per_second": tokens_per_sec,
+            "dist_temperature": model.cb_decoder.dist_temp.item()
         }, step=step) 
         wandb.log({k:v.item() for k,v in losses_accum.items()}, step=step)
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train - {dictloss2str(losses_accum)}\n")
 
 if ddp:
     destroy_process_group()
