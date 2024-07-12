@@ -9,6 +9,39 @@ from torch.nn import functional as F
 import tiktoken
 from hellaswag import render_example, iterate_examples, get_most_likely_row
 
+### Codebook Usage 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+
+def get_codebook_usage(codebook_indices, num_elements):
+    # Calculate Codebook Usage
+    codebook_usage = {}
+    for i in range(codebook_indices.shape[-1]):
+        indices = codebook_indices[...,i].view(-1)
+        codebook_usage[i] = torch.bincount(indices, minlength=num_elements)/ indices.shape[0]
+
+    return codebook_usage
+
+
+def plot_codebook_usage(codebook_usage, num_elements, ddp=False, dist=None):
+    # Plot Codebook Usage
+    fig, axes = plt.subplots(len(codebook_usage), 1, figsize=(12, 4*len(codebook_usage)))
+    if len(codebook_usage) == 1:
+        axes = [axes]
+
+    for i, usage in codebook_usage.items():
+        usage_array = usage.detach().cpu().numpy()
+
+        sns.barplot(x=np.arange(num_elements), y=usage_array, ax=axes[i])
+        axes[i].set_title(f'Codebook Usage for Block {i+1}')
+        axes[i].set_xlabel('Codebook Index')
+        axes[i].set_ylabel('Usage Count')
+
+    plt.tight_layout()
+    return fig
+
 # -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
@@ -19,7 +52,7 @@ from hellaswag import render_example, iterate_examples, get_most_likely_row
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from model import GPT, GPTConfig
+from model_VQVAE import GPT, GPTConfig
 from dataset import DataLoaderLite
 
 # set up DDP (distributed data parallel).
@@ -59,7 +92,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 32 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -137,20 +170,37 @@ for step in range(max_steps):
         model.eval()
         val_loader.reset()
         with torch.no_grad():
-            val_loss_accum = 0.0
+            val_loss_accum = {}
             val_loss_steps = 20
+            codebook_usage = {}
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
+                    logits, vq_indices, loss = model(x, y)
+                    
+                micro_codebook_usage = get_codebook_usage(vq_indices, model_config.cb_num_elements)
+                for block in micro_codebook_usage:
+                    codebook_usage[block] = codebook_usage.get(block,0) + micro_codebook_usage[block]/ val_loss_steps
+
+                for loss_type in loss:
+                    val_loss_accum[loss_type] = val_loss_accum.get(loss_type,0.0) + (loss[loss_type]/val_loss_steps).detach()
+
         if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            for l in val_loss_accum:
+                dist.all_reduce(val_loss_accum[l], op=dist.ReduceOp.AVG)
+            for block in codebook_usage:
+                dist.all_reduce(codebook_usage[block], op=dist.ReduceOp.AVG)
+
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            wandb.log({"val_loss": val_loss_accum.item()}, step=step)
+            val_loss_accum = {k:v.item() for k,v in val_loss_accum.items()}
+            print(f"validation loss: {val_loss_accum}")
+            print(f"Codebook Usage: {[(codebook_usage[b]>0).sum().item() for b in codebook_usage]}")
+
+            codebook_usage_plot = plot_codebook_usage(codebook_usage, model_config.cb_num_elements)
+            wandb.log({"val_"+k:v for k,v in val_loss_accum.items()}, step=step)
+            wandb.log({'val_codebook_usage': wandb.Image(codebook_usage_plot)}, step=step)
+            
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
@@ -160,7 +210,7 @@ for step in range(max_steps):
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
@@ -182,7 +232,7 @@ for step in range(max_steps):
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
+                    logits,_, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -218,7 +268,7 @@ for step in range(max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    logits,_, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -243,6 +293,7 @@ for step in range(max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+    losses_accum = {} 
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -250,16 +301,23 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+            logits,_, losses = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-        loss = loss / grad_accum_steps
+        loss = losses["loss"] / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
+
+        for l in losses:
+            losses_accum[l] = losses_accum.get(l,0)+losses[l]/grad_accum_steps
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        for l in losses_accum:
+            dist.all_reduce(losses_accum[l], op=dist.ReduceOp.AVG)
+    
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -274,13 +332,15 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print({k:v.item() for k,v in losses_accum.items()})
         wandb.log({
             "train_loss": loss_accum.item(),
             "learning_rate": lr,
             "grad_norm": norm,
             "step_time": dt,
             "tokens_per_second": tokens_per_sec
-        }, step=step)
+        }, step=step) 
+        wandb.log({k:v.item() for k,v in losses_accum.items()}, step=step)
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
