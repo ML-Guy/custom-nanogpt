@@ -41,8 +41,8 @@ class CodebookDecoder(nn.Module):
 
         # clamp distance temperature between 0.001, 10
         # temperature = torch.clamp(temperature, min=0.001, max=10.0) # it doesn't allow grad update once value is out of bound
-        if self.dist_temp >10.0 or self.dist_temp < 0.001:
-            self.dist_temp.data.copy_(10.0 if self.dist_temp >1.0 else 0.001)
+        # if self.dist_temp >10.0 or self.dist_temp < 0.001:
+        #     self.dist_temp.data.copy_(10.0 if self.dist_temp >1.0 else 0.001)
         
         for i in range(self.num_blocks):
             embedding = x[:,:,i,:]
@@ -79,7 +79,7 @@ class CodebookDecoder(nn.Module):
                     self.ema_embedding_table[i].weight.data = self.ema_decay * self.ema_embedding_table[i].weight.data + (1 - self.ema_decay) * self.embedding_table[i].weight.data
                     self.embedding_table[i].weight.copy_(self.ema_embedding_table[i].weight)
 
-@torch.compile
+# @torch.compile
 def get_vq_loss(tok_emb, vq_tok_emb, 
             out_emb, vq_out_indices, vq_out_embd, vq_out_logits,
             target_emb, vq_tgt_indices, vq_tgt_embd, vq_tgt_logits, 
@@ -92,24 +92,27 @@ def get_vq_loss(tok_emb, vq_tok_emb,
     vq_embd_loss =  F.mse_loss(vq_tok_emb, tok_emb.detach())
 
     # Target loss
-    num_elements = vq_tgt_logits.size(-1)
+    # num_elements = vq_tgt_logits.size(-1)
     # assumption target indicies are correct -> source logit should point towards target indices 
     # Below CE loss Updates model logits and codebook symmetricaly
-    vq_out_ce_loss = F.cross_entropy(vq_out_logits.view(-1, num_elements), vq_tgt_indices.view(-1))
+    # vq_out_ce_loss = F.cross_entropy(vq_out_logits.view(-1, num_elements), vq_tgt_indices.view(-1))
+
+    vq_out_loss =  F.mse_loss(vq_out_embd, out_emb.detach()) + vq_beta["vq_commit_loss"] * F.mse_loss(vq_out_embd.detach(), out_emb)
 
     # assumption decoded indicies are correct -> target logit should point towards decoded indices 
     # Below CE loss Updates token embedding and codebook symmetricaly
-    vq_tgt_ce_loss = F.cross_entropy(vq_tgt_logits.view(-1, num_elements), vq_out_indices.view(-1))
-    vq_loss = vq_beta["vq_out_ce_loss"] * vq_out_ce_loss \
-            + vq_beta["vq_tgt_ce_loss"] * vq_tgt_ce_loss \
-            + vq_beta["vq_commit_loss"] * vq_commit_loss \
+    # vq_tgt_ce_loss = F.cross_entropy(vq_tgt_logits.view(-1, num_elements), vq_out_indices.view(-1))
+    vq_loss = vq_out_loss + vq_beta["vq_commit_loss"] * vq_commit_loss \
             + vq_beta["vq_embd_loss"] * vq_embd_loss
+            # vq_beta["vq_out_ce_loss"] * vq_out_ce_loss \
+            # + vq_beta["vq_tgt_ce_loss"] * vq_tgt_ce_loss \
 
     loss["vq_loss"] = vq_loss
     loss["vq_commit_loss"] = vq_commit_loss
     loss["vq_embd_loss"] = vq_embd_loss
-    loss["vq_tgt_ce_loss"] = vq_tgt_ce_loss
-    loss["vq_out_ce_loss"] = vq_out_ce_loss
+    loss["vq_out_loss"] = vq_out_loss
+    # loss["vq_tgt_ce_loss"] = vq_tgt_ce_loss
+    # loss["vq_out_ce_loss"] = vq_out_ce_loss
 
     return loss
 
@@ -119,7 +122,7 @@ def get_vq_loss(tok_emb, vq_tok_emb,
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 1 # number of layers
+    n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     cb_num_elements = 256
