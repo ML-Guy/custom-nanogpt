@@ -10,7 +10,7 @@ from model import *
 
 class CodebookDecoder(nn.Module):
     def __init__(self, num_elements: int = 1000, embedding_dim: int = 256, num_blocks: int = 3, ema_decay=0,
-                 resampling: str = "noise", temperature:float = 1):
+                 resampling: str = "noise", temperature:float = 1, capacity_factor:float =1.5 ):
         super().__init__()
         self.num_blocks = num_blocks
         self.num_elements = num_elements
@@ -21,6 +21,7 @@ class CodebookDecoder(nn.Module):
         self.resampling_method = resampling
         self.temperature = temperature
         self.dist_temp = nn.Parameter(torch.ones(1))
+        self.capacity_factor = capacity_factor
 
         self.ema_decay = ema_decay
         if self.ema_decay:
@@ -32,8 +33,8 @@ class CodebookDecoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> List:
         # Reshape ouput: (B, T , num_blocks * embedding_dim) -> (B, T, num_blocks, embedding_dim)
-        B,T, embd_dim = x.size()
-        x = x.view(B,T , self.num_blocks, self.embedding_dim)
+        B, T, embd_dim = x.size()
+        x = x.view(B, T, self.num_blocks, self.embedding_dim)
 
         decoded_indices = []
         decoded_latents = []
@@ -44,30 +45,43 @@ class CodebookDecoder(nn.Module):
         if self.dist_temp >10.0 or self.dist_temp < 0.001:
             self.dist_temp.data.copy_(10.0 if self.dist_temp >1.0 else 0.001)
         
+        # Calculate expert capacity
+        tokens_per_batch = B * T
+        expert_capacity = int((tokens_per_batch / self.num_elements) * self.capacity_factor)
+
         for i in range(self.num_blocks):
             embedding = x[:,:,i,:]
 
-            # Find closest embeddings,
-            dist = (embedding[...,None,:]- self.embedding_table[i].weight[None,None,...]).pow(2).sum(dim=3) 
-            dist_logit = -dist/self.dist_temp + 1e-5  # B, T, num_elements
+            dist = (embedding[...,None,:] - self.embedding_table[i].weight[None,None,...]).pow(2).sum(dim=3) 
+            dist_logit = -dist / self.dist_temp + 1e-5  # B, T, num_elements
+            dist_norm = F.softmax(dist_logit, dim=-1)
+            
+            # Apply noise resampling with balanced token distribution
+            noise = 1 - self.temperature * torch.rand_like(dist_norm)
+            noisy_dist = dist_norm * noise
+            
+            # Use topk to select the top expert_capacity elements for each expert
+            topk_values, topk_indices = torch.topk(noisy_dist, k=expert_capacity, dim=1)
+            
+            # Create a mask for the selected indices
+            mask = torch.zeros_like(noisy_dist, dtype=torch.bool)
+            mask.scatter_(1, topk_indices, True)
+            
+            # Assign tokens to experts, argmax to select the expert with the highest noisy probability
+            embedding_index = torch.argmax(mask.float() * noisy_dist, dim=-1)
 
-            dist_norm = F.softmax(dist_logit, dim=1)
-            # Apply noise resampling
-            noise = 1-self.temperature*torch.rand_like(dist_norm)
-            embedding_index = torch.argmax(dist_norm * noise, dim=-1)
             decoded_latent = self.embedding_table[i](embedding_index)
 
             decoded_indices.append(embedding_index)
             decoded_latents.append(decoded_latent)
             dist_logits.append(dist_logit)
 
+        decoded_indices = torch.stack(decoded_indices, dim=2)  # B, T, num_block
+        decoded_latents = torch.cat(decoded_latents, dim=2)  # B, T, num_block * embd 
+        dist_logits = torch.stack(dist_logits, dim=2)  # B, T, num_block, num_elements
 
-        decoded_indices = torch.stack(decoded_indices, dim=2) # B,T, num_block
-        decoded_latents = torch.cat(decoded_latents, dim=2) # B,T, num_block * embd 
-        dist_logits = torch.stack(dist_logits, dim=2) # B,T, num_block, num_elements
-
-        return  decoded_indices, decoded_latents, dist_logits
-    
+        return decoded_indices, decoded_latents, dist_logits
+        
     def decode(self, indices: torch.Tensor ) -> torch.Tensor:
         embeddings = [self.embedding_table[i](indices[..., i]) for i in range(self.num_blocks)]
         return torch.cat(embeddings, dim=2) # B, T, Embeddings
