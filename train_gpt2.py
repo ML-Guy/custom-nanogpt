@@ -94,7 +94,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 32 # micro batch size
+B = 16 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -335,7 +335,8 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f}| dist_temp: {model.cb_decoder.dist_temp.item():.3f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        dist_temp = model.module.cb_decoder.dist_temp.item() if ddp else model.cb_decoder.dist_temp.item()
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f}| dist_temp: {dist_temp:.3f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         print(dictloss2str(losses_accum))
         wandb.log({
             "train_loss": loss_accum.item(),
@@ -343,7 +344,7 @@ for step in range(max_steps):
             "grad_norm": norm,
             "step_time": dt,
             "tokens_per_second": tokens_per_sec,
-            "dist_temperature": model.cb_decoder.dist_temp.item()
+            "dist_temperature": dist_temp
         }, step=step) 
         wandb.log({k:v.item() for k,v in losses_accum.items()}, step=step)
         with open(log_file, "a") as f:
