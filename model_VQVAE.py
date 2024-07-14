@@ -23,6 +23,11 @@ class CodebookDecoder(nn.Module):
         self.dist_temp = nn.Parameter(torch.ones(1))
         self.capacity_factor = capacity_factor
 
+        self.embedding_decoder =  nn.ModuleList([nn.Linear(embedding_dim, num_elements, bias=False) for _ in range(num_blocks)])
+        for i in range(num_blocks):
+            self.embedding_table[i].weight = self.embedding_decoder[i].weight
+
+
         self.ema_decay = ema_decay
         if self.ema_decay:
             # self.ema_embedding_table = self.embedding_table.clone().detach() # Dont exist
@@ -51,14 +56,12 @@ class CodebookDecoder(nn.Module):
 
         for i in range(self.num_blocks):
             embedding = x[:,:,i,:]
-
-            dist = (embedding[...,None,:] - self.embedding_table[i].weight[None,None,...]).pow(2).sum(dim=3) 
-            dist_logit = -dist / self.dist_temp + 1e-5  # B, T, num_elements
-            dist_norm = F.softmax(dist_logit, dim=-1)
+ 
+            dist_logit = self.embedding_decoder[i](embedding) # B, T, num_elements
             
             # Apply noise resampling with balanced token distribution
-            noise = 1 - self.temperature * torch.rand_like(dist_norm)
-            noisy_dist = dist_norm * noise
+            noise = 1 - self.temperature * torch.rand_like(dist_logit)
+            noisy_dist = dist_logit * noise
             
             # Use topk to select the top expert_capacity elements for each expert
             topk_values, topk_indices = torch.topk(noisy_dist, k=expert_capacity, dim=1)
