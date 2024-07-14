@@ -79,20 +79,21 @@ class CodebookDecoder(nn.Module):
                     self.ema_embedding_table[i].weight.data = self.ema_decay * self.ema_embedding_table[i].weight.data + (1 - self.ema_decay) * self.embedding_table[i].weight.data
                     self.embedding_table[i].weight.copy_(self.ema_embedding_table[i].weight)
 
-@torch.compile
-def get_vq_loss(tok_emb, vq_tok_emb, 
+# @torch.compile
+def get_vq_loss(tok_emb, vq_indices, vq_tok_emb, vq_in_logits, 
             out_emb, vq_out_indices, vq_out_embd, vq_out_logits,
             target_emb, vq_tgt_indices, vq_tgt_embd, vq_tgt_logits, 
             num_blocks, vq_beta: dict[str,float])-> dict:
     
     loss = {}
+    num_elements = vq_tgt_logits.size(-1)
 
     # Commitment loss: Input
-    vq_commit_loss = F.mse_loss(vq_tok_emb.detach(), tok_emb)
-    vq_embd_loss =  F.mse_loss(vq_tok_emb, tok_emb.detach())
+    # vq_commit_loss = F.mse_loss(vq_tok_emb.detach(), tok_emb)
+    # vq_embd_loss =  F.mse_loss(vq_tok_emb, tok_emb.detach())
+    vq_in_ce_loss = F.cross_entropy(vq_in_logits.view(-1, num_elements), vq_indices.view(-1))
 
     # Target loss
-    num_elements = vq_tgt_logits.size(-1)
     # assumption target indicies are correct -> source logit should point towards target indices 
     # Below CE loss Updates model logits and codebook symmetricaly
     vq_out_ce_loss = F.cross_entropy(vq_out_logits.view(-1, num_elements), vq_tgt_indices.view(-1))
@@ -102,12 +103,12 @@ def get_vq_loss(tok_emb, vq_tok_emb,
     vq_tgt_ce_loss = F.cross_entropy(vq_tgt_logits.view(-1, num_elements), vq_out_indices.view(-1))
     vq_loss = vq_beta["vq_out_ce_loss"] * vq_out_ce_loss \
             + vq_beta["vq_tgt_ce_loss"] * vq_tgt_ce_loss \
-            + vq_beta["vq_commit_loss"] * vq_commit_loss \
-            + vq_beta["vq_embd_loss"] * vq_embd_loss
+            + vq_beta["vq_embd_loss"] * vq_in_ce_loss
+            # + vq_beta["vq_commit_loss"] * vq_commit_loss \
 
     loss["vq_loss"] = vq_loss
-    loss["vq_commit_loss"] = vq_commit_loss
-    loss["vq_embd_loss"] = vq_embd_loss
+    # loss["vq_commit_loss"] = vq_commit_loss
+    loss["vq_in_ce_loss"] = vq_in_ce_loss
     loss["vq_tgt_ce_loss"] = vq_tgt_ce_loss
     loss["vq_out_ce_loss"] = vq_out_ce_loss
 
@@ -213,7 +214,7 @@ class GPT(nn.Module):
             
             # Cross Entropy loss  - correct target # bring logits near correct target logits
 
-            vq_loss = get_vq_loss(tok_emb, vq_tok_emb, 
+            vq_loss = get_vq_loss(tok_emb, vq_indices, vq_tok_emb, vq_in_logits, 
                                   x, vq_out_indices, vq_out_embd, vq_out_logits,
                                   target_emb, vq_tgt_indices, vq_tgt_embd, vq_tgt_logits, 
                                   self.config.cb_num_blocks, self.config.vq_beta)
